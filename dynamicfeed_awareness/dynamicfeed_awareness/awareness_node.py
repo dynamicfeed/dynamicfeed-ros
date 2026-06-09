@@ -114,7 +114,8 @@ class AwarenessNode(Node):
                          "lon": self.get_parameter("longitude").value},
         }).encode("utf-8")
         req = urllib.request.Request(self.base + "/v1/awareness", data=body,
-                                     headers={"Content-Type": "application/json"})
+                                     headers={"Content-Type": "application/json",
+                                              "User-Agent": "dynamicfeed-ros/0.1 (+https://dynamicfeed.ai)"})
         with urllib.request.urlopen(req, timeout=20) as r:
             return r.read().decode("utf-8")
 

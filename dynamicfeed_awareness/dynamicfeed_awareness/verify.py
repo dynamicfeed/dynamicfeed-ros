@@ -18,6 +18,7 @@ import urllib.request
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 DEFAULT_BASE = "https://dynamicfeed.ai"
+USER_AGENT = "dynamicfeed-ros/0.1 (+https://dynamicfeed.ai; hello@dynamicfeed.ai)"
 
 # Dynamic Feed's published signing key (pin this for safety-critical robots; verify against
 # https://dynamicfeed.ai/.well-known/keys before trusting). key_id -> base64url raw 32-byte pubkey.
@@ -37,7 +38,8 @@ def canonical(payload: dict) -> bytes:
 
 def fetch_keys(base: str = DEFAULT_BASE, timeout: float = 10.0) -> dict:
     """Fetch the issuer JWKS (key_id -> base64url pubkey). Prefer a pinned key for safety-critical use."""
-    with urllib.request.urlopen(base.rstrip("/") + "/.well-known/keys", timeout=timeout) as r:
+    req = urllib.request.Request(base.rstrip("/") + "/.well-known/keys", headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
 
 
