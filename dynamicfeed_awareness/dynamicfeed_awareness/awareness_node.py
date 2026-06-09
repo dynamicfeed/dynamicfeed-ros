@@ -25,11 +25,14 @@ Topics (standard sensor_msgs where they exist; custom dynamicfeed_msgs where ROS
   ~/hazards              dynamicfeed_msgs/HazardAlert
   /diagnostics           diagnostic_msgs/DiagnosticArray  overall verdict + signature/freshness state
 """
+import datetime as _dt
 import json
 import urllib.request
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
+from builtin_interfaces.msg import Time
 from std_msgs.msg import Header
 from sensor_msgs.msg import Temperature, RelativeHumidity
 from geometry_msgs.msg import Vector3Stamped
@@ -39,6 +42,22 @@ from dynamicfeed_msgs.msg import Provenance, AirQuality, SpaceWeather, GpsInterf
 from . import verify as dfverify
 
 NAN = float("nan")
+# Latched QoS for alerts so a late-joining node still receives the last hazard / interference message.
+LATCHED = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE,
+                     durability=DurabilityPolicy.TRANSIENT_LOCAL, history=HistoryPolicy.KEEP_LAST)
+
+
+def _iso_to_time(s):
+    """Parse an ISO 8601 timestamp to builtin_interfaces/Time; zero Time if unparseable."""
+    t = Time()
+    try:
+        dt = _dt.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        epoch = dt.timestamp()
+        t.sec = int(epoch)
+        t.nanosec = int((epoch - int(epoch)) * 1e9)
+    except Exception:
+        pass
+    return t
 
 
 def _num(fact, default=NAN):
@@ -68,13 +87,13 @@ class AwarenessNode(Node):
         except Exception as e:  # offline / unreachable — pinned key still works
             self.get_logger().warn("could not fetch JWKS (%s); using pinned key only" % e)
 
-        self.pub_temp = self.create_publisher(Temperature, "~/weather/temperature", 10)
-        self.pub_hum = self.create_publisher(RelativeHumidity, "~/weather/humidity", 10)
-        self.pub_wind = self.create_publisher(Vector3Stamped, "~/weather/wind", 10)
-        self.pub_aq = self.create_publisher(AirQuality, "~/air_quality", 10)
-        self.pub_sw = self.create_publisher(SpaceWeather, "~/space_weather", 10)
-        self.pub_gps = self.create_publisher(GpsInterference, "~/gps_interference", 10)
-        self.pub_haz = self.create_publisher(HazardAlert, "~/hazards", 10)
+        self.pub_temp = self.create_publisher(Temperature, "/dynamic_feed/weather/temperature", qos_profile_sensor_data)
+        self.pub_hum = self.create_publisher(RelativeHumidity, "/dynamic_feed/weather/humidity", qos_profile_sensor_data)
+        self.pub_wind = self.create_publisher(Vector3Stamped, "/dynamic_feed/weather/wind", qos_profile_sensor_data)
+        self.pub_aq = self.create_publisher(AirQuality, "/dynamic_feed/air_quality", qos_profile_sensor_data)
+        self.pub_sw = self.create_publisher(SpaceWeather, "/dynamic_feed/space_weather", qos_profile_sensor_data)
+        self.pub_gps = self.create_publisher(GpsInterference, "/dynamic_feed/gps_interference", LATCHED)
+        self.pub_haz = self.create_publisher(HazardAlert, "/dynamic_feed/hazards", LATCHED)
         self.pub_diag = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
 
         period = float(self.get_parameter("poll_period_s").value)
@@ -108,11 +127,14 @@ class AwarenessNode(Node):
             p.age_seconds = float(fact.get("age_s") or 0.0)
         except (TypeError, ValueError):
             p.age_seconds = 0.0
-        p.stale = bool(fact.get("stale"))
+        p.freshness_state = Provenance.FRESHNESS_STALE if fact.get("stale") else Provenance.FRESHNESS_LIVE
+        p.max_age_seconds = NAN
         p.signature_valid = bool(sig_ok)
         p.key_id = kid or ""
         p.snapshot_id = snap or ""
-        p.measured_at = str(fact.get("observed_at", ""))
+        p.canonicalization = "json-sorted-compact"
+        p.measured_at = _iso_to_time(fact.get("observed_at"))
+        p.reported_at = _iso_to_time(fact.get("observed_at"))
         return p
 
     def poll(self):

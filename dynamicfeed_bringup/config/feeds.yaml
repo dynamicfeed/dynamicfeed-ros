@@ -1,0 +1,8 @@
+dynamicfeed_awareness:
+  ros__parameters:
+    base_url: "https://dynamicfeed.ai"
+    latitude: 51.5
+    longitude: -0.12
+    robot_class: "ground"        # ground | aerial | marine | orbital | humanoid
+    poll_period_s: 60.0
+    require_signature: true       # drop data whose Ed25519 signature did not verify on the robot

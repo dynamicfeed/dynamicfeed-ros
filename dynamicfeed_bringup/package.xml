@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>dynamicfeed_bringup</name>
+  <version>0.1.0</version>
+  <description>Launch files and configuration for running Dynamic Feed situational awareness on ROS 2.</description>
+  <maintainer email="hello@dynamicfeed.ai">Dynamic Feed</maintainer>
+  <license>MIT</license>
+  <url type="website">https://dynamicfeed.ai/standard</url>
+  <url type="repository">https://github.com/dynamicfeed/dynamicfeed-ros</url>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>dynamicfeed_awareness</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
