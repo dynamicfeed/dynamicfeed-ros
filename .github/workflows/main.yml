@@ -1,0 +1,23 @@
+name: CI
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  build:
+    name: colcon build (${{ matrix.ros_distro }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ros_distro: [humble, jazzy]
+    container: ros:${{ matrix.ros_distro }}-ros-base
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: src/dynamicfeed-ros }
+      - name: rosdep
+        run: |
+          apt-get update && rosdep update --rosdistro ${{ matrix.ros_distro }}
+          rosdep install --from-paths src --ignore-src -r -y
+      - name: colcon build
+        shell: bash
+        run: |
+          . /opt/ros/${{ matrix.ros_distro }}/setup.sh
+          colcon build --packages-select dynamicfeed_msgs dynamicfeed_awareness --event-handlers console_direct+
