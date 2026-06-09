@@ -36,6 +36,7 @@ from builtin_interfaces.msg import Time
 from std_msgs.msg import Header
 from sensor_msgs.msg import Temperature, RelativeHumidity
 from geometry_msgs.msg import Vector3Stamped
+from geographic_msgs.msg import GeoPoint
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from dynamicfeed_msgs.msg import Provenance, AirQuality, SpaceWeather, GpsInterference, HazardAlert
 
@@ -76,6 +77,7 @@ class AwarenessNode(Node):
         self.declare_parameter("base_url", dfverify.DEFAULT_BASE)
         self.declare_parameter("poll_period_s", 60.0)
         self.declare_parameter("require_signature", True)
+        self.declare_parameter("nearby_radius_km", 500.0)
 
         self.base = str(self.get_parameter("base_url").value).rstrip("/")
         self.require_sig = bool(self.get_parameter("require_signature").value)
@@ -138,6 +140,41 @@ class AwarenessNode(Node):
         p.reported_at = _iso_to_time(fact.get("observed_at"))
         return p
 
+    def _publish_nearby(self):
+        """Fetch /v1/nearby, verify its signature, and publish each hazard as a HazardAlert."""
+        radius = float(self.get_parameter("nearby_radius_km").value)
+        url = "%s/v1/nearby?lat=%s&lon=%s&radius_km=%s" % (
+            self.base, self.get_parameter("latitude").value,
+            self.get_parameter("longitude").value, radius)
+        req = urllib.request.Request(url, headers={"User-Agent": "dynamicfeed-ros/0.1 (+https://dynamicfeed.ai)"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                env = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            self.get_logger().warn("nearby fetch failed: %s" % e)
+            return
+        sig_ok, detail = dfverify.verify(env, self.keys)
+        if not sig_ok and self.require_sig:
+            self.get_logger().error("nearby signature unverified (%s) — dropping hazards" % detail)
+            return
+        kid = (env.get("signature") or {}).get("key_id", "")
+        snap = env.get("snapshot_id", "")
+        for hz in (env.get("hazards") or []):
+            h = HazardAlert()
+            h.header = self._hdr()
+            h.category = str(hz.get("category", "hazard"))
+            h.severity = str(hz.get("severity", ""))
+            h.headline = str(hz.get("headline", ""))
+            loc = GeoPoint()
+            loc.latitude = float(hz.get("latitude") or 0.0)
+            loc.longitude = float(hz.get("longitude") or 0.0)
+            loc.altitude = 0.0
+            h.location = loc
+            h.distance_km = float(hz["distance_km"]) if hz.get("distance_km") is not None else NAN
+            h.magnitude = float(hz["magnitude"]) if hz.get("magnitude") is not None else NAN
+            h.provenance = self._prov({"source": hz.get("source"), "observed_at": hz.get("time")}, sig_ok, kid, snap)
+            self.pub_haz.publish(h)
+
     def poll(self):
         try:
             env = json.loads(self._fetch())
@@ -182,12 +219,7 @@ class AwarenessNode(Node):
             m.level = int(_num({"value": gi.get("level")}, 0) or 0); m.confidence = float(gi.get("confidence") or 0.0)
             m.method = "adsb-nic-nacp"; m.provenance = self._prov(gi, sig_ok, kid, snap)
             self.pub_gps.publish(m)
-        for f in (env.get("facts") or []):
-            if str(f.get("domain")) in ("hazard", "disaster") or str(f.get("id", "")).startswith("hz."):
-                h = HazardAlert(); h.header = self._hdr(); h.category = str(f.get("domain", "hazard"))
-                h.headline = str(f.get("value", "")); h.severity = str(f.get("severity", ""))
-                h.distance_km = NAN; h.magnitude = NAN
-                h.provenance = self._prov(f, sig_ok, kid, snap); self.pub_haz.publish(h)
+        self._publish_nearby()
 
         verdict = (env.get("verdict") or {}).get("status", "?")
         degraded = bool(env.get("degraded"))
