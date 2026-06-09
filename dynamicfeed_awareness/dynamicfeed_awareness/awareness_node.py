@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""
+dynamicfeed_awareness — ROS 2 node publishing Dynamic Feed signed situational awareness.
+
+Polls POST /v1/awareness for the robot's location, VERIFIES the Ed25519 signature on the robot
+(verify, don't trust), and republishes the grounded facts as standard ROS messages — so an
+existing nav/perception stack consumes them with no Dynamic-Feed-specific code. Every custom
+message carries a Provenance envelope (source, freshness, signature_valid). If the signature does
+not verify and require_signature is true, the node raises a diagnostic ERROR and drops the data.
+
+Parameters:
+  latitude (float, 51.5), longitude (float, -0.12)   the robot's location
+  robot_class (str, 'ground')                          ground|aerial|marine|orbital|humanoid
+  base_url (str, https://dynamicfeed.ai)
+  poll_period_s (float, 60.0)
+  require_signature (bool, true)                       drop data whose signature didn't verify
+
+Topics (standard sensor_msgs where they exist; custom dynamicfeed_msgs where ROS has nothing):
+  ~/weather/temperature  sensor_msgs/Temperature        (when the feed provides it)
+  ~/weather/humidity     sensor_msgs/RelativeHumidity   (when provided)
+  ~/weather/wind         geometry_msgs/Vector3Stamped   m/s
+  ~/air_quality          dynamicfeed_msgs/AirQuality
+  ~/space_weather        dynamicfeed_msgs/SpaceWeather
+  ~/gps_interference     dynamicfeed_msgs/GpsInterference
+  ~/hazards              dynamicfeed_msgs/HazardAlert
+  /diagnostics           diagnostic_msgs/DiagnosticArray  overall verdict + signature/freshness state
+"""
+import json
+import urllib.request
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Header
+from sensor_msgs.msg import Temperature, RelativeHumidity
+from geometry_msgs.msg import Vector3Stamped
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+from dynamicfeed_msgs.msg import Provenance, AirQuality, SpaceWeather, GpsInterference, HazardAlert
+
+from . import verify as dfverify
+
+NAN = float("nan")
+
+
+def _num(fact, default=NAN):
+    try:
+        return float(fact.get("value"))
+    except (TypeError, ValueError, AttributeError):
+        return default
+
+
+class AwarenessNode(Node):
+    def __init__(self):
+        super().__init__("dynamicfeed_awareness")
+        self.declare_parameter("latitude", 51.5)
+        self.declare_parameter("longitude", -0.12)
+        self.declare_parameter("robot_class", "ground")
+        self.declare_parameter("base_url", dfverify.DEFAULT_BASE)
+        self.declare_parameter("poll_period_s", 60.0)
+        self.declare_parameter("require_signature", True)
+
+        self.base = str(self.get_parameter("base_url").value).rstrip("/")
+        self.require_sig = bool(self.get_parameter("require_signature").value)
+
+        # Trust the PINNED key; opportunistically refresh from the issuer JWKS (pinned still trusted).
+        self.keys = dict(dfverify.PINNED_KEYS)
+        try:
+            self.keys.update(dfverify.fetch_keys(self.base))
+        except Exception as e:  # offline / unreachable — pinned key still works
+            self.get_logger().warn("could not fetch JWKS (%s); using pinned key only" % e)
+
+        self.pub_temp = self.create_publisher(Temperature, "~/weather/temperature", 10)
+        self.pub_hum = self.create_publisher(RelativeHumidity, "~/weather/humidity", 10)
+        self.pub_wind = self.create_publisher(Vector3Stamped, "~/weather/wind", 10)
+        self.pub_aq = self.create_publisher(AirQuality, "~/air_quality", 10)
+        self.pub_sw = self.create_publisher(SpaceWeather, "~/space_weather", 10)
+        self.pub_gps = self.create_publisher(GpsInterference, "~/gps_interference", 10)
+        self.pub_haz = self.create_publisher(HazardAlert, "~/hazards", 10)
+        self.pub_diag = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
+
+        period = float(self.get_parameter("poll_period_s").value)
+        self.timer = self.create_timer(period, self.poll)
+        self.get_logger().info(
+            "dynamicfeed_awareness up — polling %s/v1/awareness every %.0fs" % (self.base, period))
+
+    def _hdr(self):
+        h = Header()
+        h.stamp = self.get_clock().now().to_msg()
+        h.frame_id = "dynamicfeed"
+        return h
+
+    def _fetch(self):
+        body = json.dumps({
+            "robot": {"class": self.get_parameter("robot_class").value},
+            "location": {"lat": self.get_parameter("latitude").value,
+                         "lon": self.get_parameter("longitude").value},
+        }).encode("utf-8")
+        req = urllib.request.Request(self.base + "/v1/awareness", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.read().decode("utf-8")
+
+    def _prov(self, fact, sig_ok, kid, snap):
+        p = Provenance()
+        fact = fact or {}
+        p.source = str(fact.get("source", ""))
+        p.source_url = str(fact.get("source_url", ""))
+        try:
+            p.age_seconds = float(fact.get("age_s") or 0.0)
+        except (TypeError, ValueError):
+            p.age_seconds = 0.0
+        p.stale = bool(fact.get("stale"))
+        p.signature_valid = bool(sig_ok)
+        p.key_id = kid or ""
+        p.snapshot_id = snap or ""
+        p.measured_at = str(fact.get("observed_at", ""))
+        return p
+
+    def poll(self):
+        try:
+            env = json.loads(self._fetch())
+        except Exception as e:
+            self._diag(DiagnosticStatus.ERROR, "fetch failed: %s" % e, {})
+            return
+        sig_ok, detail = dfverify.verify(env, self.keys)
+        kid = (env.get("signature") or {}).get("key_id", "")
+        snap = env.get("snapshot_id", "")
+        if not sig_ok and self.require_sig:
+            self.get_logger().error("awareness signature unverified (%s) — NOT publishing" % detail)
+            self._diag(DiagnosticStatus.ERROR, "signature unverified — data dropped: %s" % detail,
+                       {"signature_valid": "false"})
+            return
+
+        facts = {f.get("id"): f for f in (env.get("facts") or [])}
+
+        if "wx.temp_c" in facts:
+            m = Temperature(); m.header = self._hdr(); m.temperature = _num(facts["wx.temp_c"], 0.0); m.variance = 0.0
+            self.pub_temp.publish(m)
+        if "wx.humidity" in facts:
+            m = RelativeHumidity(); m.header = self._hdr()
+            m.relative_humidity = _num(facts["wx.humidity"], 0.0) / 100.0; m.variance = 0.0
+            self.pub_hum.publish(m)
+        if "wx.wind_kmh" in facts:
+            v = Vector3Stamped(); v.header = self._hdr()
+            v.vector.x = _num(facts["wx.wind_kmh"], 0.0) / 3.6  # km/h -> m/s (speed; bearing not provided)
+            self.pub_wind.publish(v)
+        if "aq.us_aqi" in facts:
+            aq = facts["aq.us_aqi"]; m = AirQuality(); m.header = self._hdr()
+            m.us_aqi = _num(aq, 0.0); m.category = str(aq.get("category", "")); m.pm2_5 = NAN; m.pm10 = NAN
+            m.provenance = self._prov(aq, sig_ok, kid, snap); self.pub_aq.publish(m)
+        if "sw.kp_index" in facts:
+            m = SpaceWeather(); m.header = self._hdr(); m.kp_index = _num(facts["sw.kp_index"], 0.0)
+            m.storm_g = int(_num(facts.get("sw.storm_g"), 0) or 0); m.storm_s = int(_num(facts.get("sw.storm_s"), 0) or 0)
+            m.provenance = self._prov(facts["sw.kp_index"], sig_ok, kid, snap); self.pub_sw.publish(m)
+        gi = facts.get("gps.interference") or facts.get("gps.nic")
+        if gi is not None:
+            m = GpsInterference(); m.header = self._hdr()
+            m.latitude = float(self.get_parameter("latitude").value)
+            m.longitude = float(self.get_parameter("longitude").value)
+            m.level = int(_num({"value": gi.get("level")}, 0) or 0); m.confidence = float(gi.get("confidence") or 0.0)
+            m.method = "adsb-nic-nacp"; m.provenance = self._prov(gi, sig_ok, kid, snap)
+            self.pub_gps.publish(m)
+        for f in (env.get("facts") or []):
+            if str(f.get("domain")) in ("hazard", "disaster") or str(f.get("id", "")).startswith("hz."):
+                h = HazardAlert(); h.header = self._hdr(); h.category = str(f.get("domain", "hazard"))
+                h.headline = str(f.get("value", "")); h.severity = str(f.get("severity", ""))
+                h.distance_km = NAN; h.magnitude = NAN
+                h.provenance = self._prov(f, sig_ok, kid, snap); self.pub_haz.publish(h)
+
+        verdict = (env.get("verdict") or {}).get("status", "?")
+        degraded = bool(env.get("degraded"))
+        level = DiagnosticStatus.OK if (sig_ok and not degraded) else DiagnosticStatus.WARN
+        self._diag(level, "verdict=%s signature=%s degraded=%s"
+                   % (verdict, "valid" if sig_ok else detail, degraded),
+                   {"verdict": str(verdict), "signature_valid": str(bool(sig_ok)).lower(),
+                    "key_id": kid, "snapshot_id": snap, "degraded": str(degraded).lower()})
+
+    def _diag(self, level, message, values):
+        arr = DiagnosticArray(); arr.header = self._hdr()
+        st = DiagnosticStatus(); st.level = level; st.name = "dynamicfeed: awareness"
+        st.message = message; st.hardware_id = "dynamicfeed.ai"
+        st.values = [KeyValue(key=k, value=str(v)) for k, v in values.items()]
+        arr.status = [st]
+        self.pub_diag.publish(arr)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = AwarenessNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
