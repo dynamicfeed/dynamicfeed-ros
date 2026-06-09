@@ -31,7 +31,7 @@ import urllib.request
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data, QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, QoSHistoryPolicy
 from builtin_interfaces.msg import Time
 from std_msgs.msg import Header
 from sensor_msgs.msg import Temperature, RelativeHumidity
@@ -43,8 +43,8 @@ from . import verify as dfverify
 
 NAN = float("nan")
 # Latched QoS for alerts so a late-joining node still receives the last hazard / interference message.
-LATCHED = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE,
-                     durability=DurabilityPolicy.TRANSIENT_LOCAL, history=HistoryPolicy.KEEP_LAST)
+LATCHED = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.RELIABLE,
+                     durability=QoSDurabilityPolicy.TRANSIENT_LOCAL, history=QoSHistoryPolicy.KEEP_LAST)
 
 
 def _iso_to_time(s):
