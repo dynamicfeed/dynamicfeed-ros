@@ -20,4 +20,4 @@ jobs:
         shell: bash
         run: |
           . /opt/ros/${{ matrix.ros_distro }}/setup.sh
-          colcon build --packages-select dynamicfeed_msgs dynamicfeed_awareness --event-handlers console_direct+
+          colcon build --packages-select dynamicfeed_msgs dynamicfeed_awareness dynamicfeed_bringup --event-handlers console_direct+

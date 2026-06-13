@@ -24,6 +24,18 @@ Topics (standard sensor_msgs where they exist; custom dynamicfeed_msgs where ROS
   ~/gps_interference     dynamicfeed_msgs/GpsInterference
   ~/hazards              dynamicfeed_msgs/HazardAlert
   /diagnostics           diagnostic_msgs/DiagnosticArray  overall verdict + signature/freshness state
+
+Services:
+  ~/check_awareness      dynamicfeed_msgs/CheckAwareness
+      Synchronous planner-facing service: "is it safe to proceed at this location right now?"
+      Request carries lat/lon/robot_class; response includes verdict (go/caution/no-go),
+      signature_valid, snapshot_id, and grounded fact summaries. A planner should log the
+      snapshot_id alongside every action it gates on this verdict.
+
+      SAFETY CONTRACT: verdict "go" means no known disqualifying conditions at query time.
+      It is a decision INPUT, not a safety certification.  Your robot's own safety stack owns
+      the final decision.  Verdicts degrade to "caution" on uncertainty; they never fabricate
+      "go" from insufficient data.
 """
 import datetime as _dt
 import json
@@ -39,6 +51,7 @@ from geometry_msgs.msg import Vector3Stamped
 from geographic_msgs.msg import GeoPoint
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from dynamicfeed_msgs.msg import Provenance, AirQuality, SpaceWeather, GpsInterference, HazardAlert
+from dynamicfeed_msgs.srv import CheckAwareness
 
 from . import verify as dfverify
 
@@ -100,6 +113,14 @@ class AwarenessNode(Node):
 
         period = float(self.get_parameter("poll_period_s").value)
         self.timer = self.create_timer(period, self.poll)
+
+        # ~/check_awareness service — synchronous planner-facing query.
+        # A robot's motion planner calls this BEFORE committing to an action: give me the verdict
+        # for this (lat, lon, robot_class) right now, with the snapshot_id I can log alongside
+        # my decision so it's auditable.
+        self._srv_check = self.create_service(
+            CheckAwareness, "~/check_awareness", self._handle_check_awareness)
+
         self.get_logger().info(
             "dynamicfeed_awareness up — polling %s/v1/awareness every %.0fs" % (self.base, period))
 
@@ -228,6 +249,99 @@ class AwarenessNode(Node):
                    % (verdict, "valid" if sig_ok else detail, degraded),
                    {"verdict": str(verdict), "signature_valid": str(bool(sig_ok)).lower(),
                     "key_id": kid, "snapshot_id": snap, "degraded": str(degraded).lower()})
+
+    def _handle_check_awareness(self, request, response):
+        """
+        Service handler for ~/check_awareness (dynamicfeed_msgs/CheckAwareness).
+
+        Makes a FRESH /v1/awareness call for the requested location and robot_class, verifies the
+        Ed25519 signature on this robot, and fills the response.  The call is synchronous from the
+        caller's perspective — the timer-driven background topic is independent of this path.
+
+        The caller SHOULD:
+          - log response.snapshot_id alongside any action taken (audit trail)
+          - gate on (response.verdict != "no-go") AND response.signature_valid when require_signature=true
+          - treat a service timeout as CAUTION (same as the API's own degraded-floor rule)
+
+        The caller MUST NOT treat a "go" verdict as a safety certification. Dynamic Feed provides
+        verifiable situational data as a decision INPUT; your robot's safety stack owns the final
+        decision.
+        """
+        # Resolve lat/lon/robot_class — use request values if non-default, else node defaults.
+        lat = request.latitude if request.latitude != 0.0 else float(self.get_parameter("latitude").value)
+        lon = request.longitude if request.longitude != 0.0 else float(self.get_parameter("longitude").value)
+        robot_class = (request.robot_class.strip() or
+                       str(self.get_parameter("robot_class").value))
+
+        # Build and execute the awareness request.
+        body = json.dumps({
+            "robot": {"class": robot_class},
+            "location": {"lat": lat, "lon": lon},
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            self.base + "/v1/awareness", data=body,
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "dynamicfeed-ros/0.1 (+https://dynamicfeed.ai)"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                env = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            # Network or parse error — respond with caution so a caller polling with a timeout
+            # gets the degraded-floor behaviour rather than a hard exception.
+            self.get_logger().warn("check_awareness fetch failed: %s" % e)
+            response.verdict = "caution"
+            response.reason = "fetch failed: %s" % e
+            response.signature_valid = False
+            response.key_id = ""
+            response.snapshot_id = ""
+            response.fact_ids = []
+            response.fact_summaries = []
+            response.degraded = True
+            return response
+
+        sig_ok, detail = dfverify.verify(env, self.keys)
+        kid = (env.get("signature") or {}).get("key_id", "")
+        snap = env.get("snapshot_id", "")
+        degraded = bool(env.get("degraded"))
+
+        verdict_block = env.get("verdict") or {}
+        verdict = str(verdict_block.get("status", "caution"))
+        reason = str(verdict_block.get("reason", ""))
+
+        # If require_signature is set and the signature didn't verify, override the verdict to
+        # "caution" — never let unverified data produce a "go".
+        if not sig_ok and self.require_sig:
+            self.get_logger().error(
+                "check_awareness: signature unverified (%s) — verdict overridden to caution" % detail)
+            verdict = "caution"
+            reason = "signature unverified: %s" % detail
+            degraded = True
+
+        # Summarise the grounded facts for the caller's log / planner context.
+        fact_ids = []
+        fact_summaries = []
+        for f in (env.get("facts") or []):
+            fid = str(f.get("id", ""))
+            label = str(f.get("label") or f.get("id") or "")
+            value = f.get("value")
+            unit = str(f.get("unit") or "")
+            summary = "%s=%s%s" % (label, value, (" " + unit) if unit else "")
+            fact_ids.append(fid)
+            fact_summaries.append(summary)
+
+        response.verdict = verdict
+        response.reason = reason
+        response.signature_valid = bool(sig_ok)
+        response.key_id = kid
+        response.snapshot_id = snap
+        response.fact_ids = fact_ids
+        response.fact_summaries = fact_summaries
+        response.degraded = degraded
+
+        self.get_logger().info(
+            "check_awareness: lat=%.4f lon=%.4f class=%s → verdict=%s sig=%s snap=%s"
+            % (lat, lon, robot_class, verdict, "valid" if sig_ok else "INVALID", snap))
+        return response
 
     def _diag(self, level, message, values):
         arr = DiagnosticArray(); arr.header = self._hdr()

@@ -13,6 +13,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GpsInterference.msg"
   "msg/AirQuality.msg"
   "msg/SpaceWeather.msg"
+  "srv/CheckAwareness.srv"
   DEPENDENCIES std_msgs geographic_msgs builtin_interfaces
 )
 

@@ -1,0 +1,43 @@
+# Dynamic Feed — humanoid robot configuration
+#
+# Drop this into your bringup and tune latitude/longitude to the robot's operating area.
+# For an indoor robot with no GPS, keep the static coordinates for the building / city
+# (Dynamic Feed uses them for regional data: weather, hazards within 500 km, space weather).
+#
+# robot_class: "humanoid" tells the API to weight factors that matter for bipedal robots:
+#   - GPS/GNSS interference (affects localisation)
+#   - Geomagnetic storm index (affects compass-assisted heading)
+#   - Air quality (AQI) — a humanoid operating around people in degraded air should flag caution
+#   - Nearby hazards within 500 km (wildfire, earthquake, severe weather)
+#
+# SAFETY NOTE: Dynamic Feed provides verifiable situational data as a decision INPUT.
+# It is NOT a safety certification or guarantee — your robot's own safety stack owns the
+# final decision.  Verdicts degrade to "caution" on uncertainty and never fabricate "go".
+dynamicfeed_awareness:
+  ros__parameters:
+    base_url: "https://dynamicfeed.ai"
+
+    # ── Location ──────────────────────────────────────────────────────────────────────────────
+    # Static coordinates are fine for a fixed deployment (building/city level is enough for
+    # regional hazard and weather data).  For a mobile humanoid, feed these from a NavSatFix
+    # subscriber in your own node and remap, or use the check_awareness SERVICE with dynamic
+    # lat/lon on each planner decision (see humanoid_example_node.py).
+    latitude: 37.7749      # San Francisco as a demo default; replace with your site
+    longitude: -122.4194
+
+    # ── Robot class ───────────────────────────────────────────────────────────────────────────
+    robot_class: "humanoid"   # ground | aerial | marine | orbital | humanoid
+
+    # ── Polling ───────────────────────────────────────────────────────────────────────────────
+    # 60 s is appropriate for most outdoor deployments.  Increase for indoor-only robots where
+    # weather/hazard data changes slowly.  Do NOT poll faster than 30 s — the API will throttle.
+    poll_period_s: 60.0
+
+    # ── Signature policy ──────────────────────────────────────────────────────────────────────
+    # require_signature: true means the node DROPS data whose Ed25519 signature did not verify
+    # on this robot.  This is the correct setting for safety-critical use.  Set to false ONLY
+    # for development / offline testing.
+    require_signature: true
+
+    # ── Hazard radius ─────────────────────────────────────────────────────────────────────────
+    nearby_radius_km: 500.0

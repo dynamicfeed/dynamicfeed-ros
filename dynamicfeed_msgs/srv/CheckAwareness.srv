@@ -1,0 +1,27 @@
+# CheckAwareness — synchronous awareness query for a planner-gated "proceed" decision.
+#
+# A humanoid robot's action planner calls this BEFORE committing to a waypoint or
+# motion primitive: the response carries the verdict (go/caution/no-go), the grounded
+# facts that drove it, whether the Ed25519 signature verified on the robot, and the
+# snapshot hash so the planner can log exactly what it acted on.
+#
+# SAFETY CONTRACT: verdict "go" means "no known disqualifying conditions at query time".
+# It is a decision INPUT, not a safety certification.  Your robot's own safety stack
+# owns the final decision.  Verdicts degrade to "caution" on uncertainty and never
+# fabricate "go" from insufficient data.
+#
+# ------- request -------
+float64 latitude          # decimal degrees  (WGS-84)
+float64 longitude         # decimal degrees  (WGS-84)
+string  robot_class       # "humanoid" | "ground" | "aerial" | "marine" | "orbital"
+                          # leave empty to use the node's default robot_class parameter
+---
+# ------- response ------
+string   verdict          # "go" | "caution" | "no-go"
+string   reason           # one-line human-readable explanation from the API
+bool     signature_valid  # true iff the response's Ed25519 signature verified ON THIS ROBOT
+string   key_id           # signing key id (https://dynamicfeed.ai/.well-known/keys)
+string   snapshot_id      # the signed snapshot hash — log this with every decision
+string[] fact_ids         # ids of the grounded facts present in the response
+string[] fact_summaries   # parallel array: human-readable summary of each fact
+bool     degraded         # true if Dynamic Feed returned partial/degraded data
